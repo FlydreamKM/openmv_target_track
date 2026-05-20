@@ -153,7 +153,7 @@ std::string OutputWriter::formatJSON(const Pose3D& p, int id) {
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     
-    char buf[512];
+    char buf[1024];
     snprintf(buf, sizeof(buf),
         "{"
         "\"id\":%d,"
@@ -165,6 +165,17 @@ std::string OutputWriter::formatJSON(const Pose3D& p, int id) {
         "\"has_world\":%s,"
         "\"dist\":%.4f,"
         "\"valid\":%s,"
+        "\"spot\":{"
+        "\"has\":%s,\"px\":%.2f,\"py\":%.2f,"
+        "\"err_x\":%.2f,\"err_y\":%.2f,"
+        "\"spot_yaw\":%.4f,\"spot_pitch\":%.4f,"
+        "\"spot_yaw_deg\":%.2f,\"spot_pitch_deg\":%.2f"
+        "},"
+        "\"imu\":{"
+        "\"has\":%s,"
+        "\"q\":[%.4f,%.4f,%.4f,%.4f],"
+        "\"euler_deg\":[%.2f,%.2f,%.2f]"
+        "},"
         "\"t\":%lld"
         "}",
         id,
@@ -176,6 +187,14 @@ std::string OutputWriter::formatJSON(const Pose3D& p, int id) {
         p.hasWorldCoord ? "true" : "false",
         p.distance,
         p.valid ? "true" : "false",
+        p.hasBrightSpot ? "true" : "false",
+        p.brightSpotPixel.x, p.brightSpotPixel.y,
+        p.spotOffsetX, p.spotOffsetY,
+        p.spotYaw, p.spotPitch,
+        p.spotYaw * 180.0f / CV_PI, p.spotPitch * 180.0f / CV_PI,
+        p.hasImu ? "true" : "false",
+        p.imuQuaternion[0], p.imuQuaternion[1], p.imuQuaternion[2], p.imuQuaternion[3],
+        p.imuEulerDeg.x, p.imuEulerDeg.y, p.imuEulerDeg.z,
         static_cast<long long>(now_ms)
     );
     return std::string(buf);
@@ -185,9 +204,11 @@ std::string OutputWriter::formatCSV(const Pose3D& p, int id) {
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     
-    char buf[256];
+    char buf[512];
     snprintf(buf, sizeof(buf),
-        "%d,%.2f,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%s,%s,%lld",
+        "%d,%.2f,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%s,%s,"
+        "%s,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,"
+        "%s,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%lld",
         id,
         p.pixelOffsetX, p.pixelOffsetY,
         p.yaw, p.pitch,
@@ -196,13 +217,20 @@ std::string OutputWriter::formatCSV(const Pose3D& p, int id) {
         p.distance,
         p.hasWorldCoord ? "1" : "0",
         p.valid ? "1" : "0",
+        p.hasBrightSpot ? "1" : "0",
+        p.brightSpotPixel.x, p.brightSpotPixel.y,
+        p.spotOffsetX, p.spotOffsetY,
+        p.spotYaw, p.spotPitch,
+        p.hasImu ? "1" : "0",
+        p.imuQuaternion[0], p.imuQuaternion[1], p.imuQuaternion[2], p.imuQuaternion[3],
+        p.imuEulerDeg.x, p.imuEulerDeg.y, p.imuEulerDeg.z,
         static_cast<long long>(now_ms)
     );
     return std::string(buf);
 }
 
 std::string OutputWriter::formatBinary(const Pose3D& p, int id) {
-    // Compact binary packet: 40 bytes
+    // Compact binary packet: 102 bytes
     struct __attribute__((packed)) Packet {
         uint8_t sync = 0xAA;
         int16_t id;
@@ -211,7 +239,14 @@ std::string OutputWriter::formatBinary(const Pose3D& p, int id) {
         float cx, cy, cz;
         float wx, wy, wz;
         float dist;
-        uint8_t flags;
+        uint8_t flags;          // bit0=valid, bit1=hasWorld, bit2=hasSpot, bit3=hasImu
+        // 光点信息
+        float spotX, spotY;
+        float spotErrX, spotErrY;
+        float spotYaw, spotPitch;
+        // IMU姿态
+        float qw, qx, qy, qz;
+        float roll, pitch_imu, yaw_imu;
         uint16_t crc;
     } pkt;
     
@@ -227,24 +262,48 @@ std::string OutputWriter::formatBinary(const Pose3D& p, int id) {
     pkt.wy = p.worldCoord.y;
     pkt.wz = p.worldCoord.z;
     pkt.dist = p.distance;
-    pkt.flags = (p.valid ? 0x01 : 0) | (p.hasWorldCoord ? 0x02 : 0);
+    pkt.flags = (p.valid ? 0x01 : 0)
+              | (p.hasWorldCoord ? 0x02 : 0)
+              | (p.hasBrightSpot ? 0x04 : 0)
+              | (p.hasImu ? 0x08 : 0);
+    pkt.spotX = p.brightSpotPixel.x;
+    pkt.spotY = p.brightSpotPixel.y;
+    pkt.spotErrX = p.spotOffsetX;
+    pkt.spotErrY = p.spotOffsetY;
+    pkt.spotYaw = p.spotYaw;
+    pkt.spotPitch = p.spotPitch;
+    pkt.qw = p.imuQuaternion[0];
+    pkt.qx = p.imuQuaternion[1];
+    pkt.qy = p.imuQuaternion[2];
+    pkt.qz = p.imuQuaternion[3];
+    pkt.roll = p.imuEulerDeg.x;
+    pkt.pitch_imu = p.imuEulerDeg.y;
+    pkt.yaw_imu = p.imuEulerDeg.z;
     pkt.crc = 0; // Simplified, add CRC16 in production
     
     return std::string(reinterpret_cast<const char*>(&pkt), sizeof(pkt));
 }
 
 std::string OutputWriter::formatCustom(const Pose3D& p, int id) {
-    // Compact text: $ID,dx,dy,yaw,pitch,cx,cy,cz,wx,wy,wz,dist,valid*
-    char buf[256];
+    // Compact text: $ID,dx,dy,yaw,pitch,cx,cy,cz,wx,wy,wz,dist,valid,spotX,spotY,spotErrX,spotErrY,spotYaw,spotPitch,imuRoll,imuPitch,imuYaw,validFlags*
+    char buf[512];
     snprintf(buf, sizeof(buf),
-        "$%d,%.1f,%.1f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d*",
+        "$%d,%.1f,%.1f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,"
+        "%.1f,%.1f,%.1f,%.1f,%.4f,%.4f,%.2f,%.2f,%.2f,%d*",
         id,
         p.pixelOffsetX, p.pixelOffsetY,
         p.yaw, p.pitch,
         p.cameraCoord.x, p.cameraCoord.y, p.cameraCoord.z,
         p.worldCoord.x, p.worldCoord.y, p.worldCoord.z,
         p.distance,
-        p.valid ? 1 : 0
+        p.valid ? 1 : 0,
+        p.brightSpotPixel.x, p.brightSpotPixel.y,
+        p.spotOffsetX, p.spotOffsetY,
+        p.spotYaw, p.spotPitch,
+        p.imuEulerDeg.x, p.imuEulerDeg.y, p.imuEulerDeg.z,
+        (p.valid ? 0x01 : 0)
+            | (p.hasBrightSpot ? 0x02 : 0)
+            | (p.hasImu ? 0x04 : 0)
     );
     return std::string(buf);
 }

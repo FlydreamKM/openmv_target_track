@@ -1,6 +1,7 @@
 #include "target_detector.hpp"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/aruco.hpp>
+#include <algorithm>
 
 namespace omt {
 
@@ -214,6 +215,282 @@ void CircleTargetDetector::setParam(const std::string& key, double value) {
     else if (key == "houghMinRadius") houghMinRadius_ = static_cast<int>(value);
     else if (key == "houghMaxRadius") houghMaxRadius_ = static_cast<int>(value);
     else if (key == "realDiameter") realDiameterMeters_ = static_cast<float>(value);
+}
+
+// ========== 方形靶标检测器 ==========
+SquareTargetDetector::SquareTargetDetector(Mode mode, float realSizeMeters)
+    : mode_(mode), realSizeMeters_(realSizeMeters) {}
+
+void SquareTargetDetector::setColorRange(const cv::Scalar& lower, const cv::Scalar& upper) {
+    hsvLower_ = lower;
+    hsvUpper_ = upper;
+}
+
+std::vector<TargetResult> SquareTargetDetector::detect(const cv::Mat& frame) {
+    if (mode_ == Mode::COLOR) {
+        return detectColor_(frame);
+    }
+    return detectEdge_(frame);
+}
+
+std::vector<TargetResult> SquareTargetDetector::detectColor_(const cv::Mat& frame) {
+    std::vector<TargetResult> results;
+    if (frame.empty()) return results;
+
+    cv::Mat hsv, mask, blurred;
+    cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
+    cv::GaussianBlur(hsv, blurred, cv::Size(5, 5), 0);
+    cv::inRange(blurred, hsvLower_, hsvUpper_, mask);
+
+    // 形态学去噪
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+    cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    for (const auto& cnt : contours) {
+        double area = cv::contourArea(cnt);
+        if (area < minArea_) continue;
+
+        // 凸包 + 多边形近似
+        std::vector<cv::Point> hull;
+        cv::convexHull(cnt, hull);
+
+        std::vector<cv::Point2f> approx;
+        double peri = cv::arcLength(hull, true);
+        cv::approxPolyDP(hull, approx, 0.02 * peri, true);
+
+        if (approx.size() != 4) continue;
+
+        // 检查是否为凸四边形
+        if (!cv::isContourConvex(approx)) continue;
+
+        // 检查宽高比
+        cv::RotatedRect rr = cv::minAreaRect(approx);
+        float aspect = std::max(rr.size.width, rr.size.height) /
+                       (std::min(rr.size.width, rr.size.height) + 1e-6f);
+        if (aspect > maxAspectRatio_) continue;
+
+        // 检查矩形度
+        double rectArea = rr.size.width * rr.size.height;
+        if (rectArea < 1.0) continue;
+        double rectangularity = area / rectArea;
+        if (rectangularity < minCircularity_) continue;
+
+        // 角点排序：按顺时针/逆时针，从左上角开始
+        // 先转换为Point2f数组用于sort
+        std::vector<cv::Point2f> corners(approx.begin(), approx.end());
+        // 按中心角度排序
+        cv::Point2f center(
+            (corners[0].x + corners[1].x + corners[2].x + corners[3].x) / 4.0f,
+            (corners[0].y + corners[1].y + corners[2].y + corners[3].y) / 4.0f
+        );
+        std::sort(corners.begin(), corners.end(),
+            [&center](const cv::Point2f& a, const cv::Point2f& b) {
+                float angleA = std::atan2(a.y - center.y, a.x - center.x);
+                float angleB = std::atan2(b.y - center.y, b.x - center.x);
+                return angleA < angleB;
+            });
+
+        TargetResult r;
+        r.center = center;
+        r.corners = corners;
+        r.area = static_cast<float>(area);
+        r.bounding_box = rr;
+        r.valid = true;
+
+        // 估算等效半径（外接圆半径）
+        float d = cv::norm(corners[0] - corners[2]);
+        r.radius = d * 0.5f;
+
+        results.push_back(r);
+    }
+
+    // 按面积从大到小排序
+    std::sort(results.begin(), results.end(),
+              [](const TargetResult& a, const TargetResult& b) { return a.area > b.area; });
+    return results;
+}
+
+std::vector<TargetResult> SquareTargetDetector::detectEdge_(const cv::Mat& frame) {
+    std::vector<TargetResult> results;
+    if (frame.empty()) return results;
+
+    cv::Mat gray;
+    if (frame.channels() == 3) {
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = frame;
+    }
+
+    // Canny边缘 + 轮廓
+    cv::Mat edges;
+    cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
+    cv::Canny(gray, edges, 50, 150);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::morphologyEx(edges, edges, cv::MORPH_CLOSE, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    for (const auto& cnt : contours) {
+        double area = cv::contourArea(cnt);
+        if (area < minArea_) continue;
+
+        std::vector<cv::Point2f> approx;
+        double peri = cv::arcLength(cnt, true);
+        cv::approxPolyDP(cnt, approx, 0.05 * peri, true);
+
+        if (approx.size() != 4) continue;
+        if (!cv::isContourConvex(approx)) continue;
+
+        cv::RotatedRect rr = cv::minAreaRect(approx);
+        float aspect = std::max(rr.size.width, rr.size.height) /
+                       (std::min(rr.size.width, rr.size.height) + 1e-6f);
+        if (aspect > maxAspectRatio_) continue;
+
+        // 角点排序
+        std::vector<cv::Point2f> corners(approx.begin(), approx.end());
+        cv::Point2f center(
+            (corners[0].x + corners[1].x + corners[2].x + corners[3].x) / 4.0f,
+            (corners[0].y + corners[1].y + corners[2].y + corners[3].y) / 4.0f
+        );
+        std::sort(corners.begin(), corners.end(),
+            [&center](const cv::Point2f& a, const cv::Point2f& b) {
+                float angleA = std::atan2(a.y - center.y, a.x - center.x);
+                float angleB = std::atan2(b.y - center.y, b.x - center.x);
+                return angleA < angleB;
+            });
+
+        TargetResult r;
+        r.center = center;
+        r.corners = corners;
+        r.area = static_cast<float>(area);
+        r.bounding_box = rr;
+        r.valid = true;
+
+        float d = cv::norm(corners[0] - corners[2]);
+        r.radius = d * 0.5f;
+
+        results.push_back(r);
+    }
+
+    std::sort(results.begin(), results.end(),
+              [](const TargetResult& a, const TargetResult& b) { return a.area > b.area; });
+    return results;
+}
+
+void SquareTargetDetector::setParam(const std::string& key, double value) {
+    if (key == "minArea") minArea_ = value;
+    else if (key == "maxAspectRatio") maxAspectRatio_ = value;
+    else if (key == "minCircularity") minCircularity_ = value;
+    else if (key == "realSize") realSizeMeters_ = static_cast<float>(value);
+}
+
+bool SquareTargetDetector::isApproximatelySquare(const std::vector<cv::Point2f>& pts, float& outSideLength) {
+    if (pts.size() != 4) return false;
+    // 计算四条边长度
+    float d[4];
+    for (int i = 0; i < 4; ++i) {
+        d[i] = cv::norm(pts[i] - pts[(i + 1) % 4]);
+    }
+    float avg = (d[0] + d[1] + d[2] + d[3]) / 4.0f;
+    if (avg < 1.0f) return false;
+    // 边长差异检查
+    for (int i = 0; i < 4; ++i) {
+        if (std::abs(d[i] - avg) / avg > 0.3f) return false;
+    }
+    outSideLength = avg;
+    return true;
+}
+
+// ========== 光点检测器 ==========
+BrightSpotDetector::BrightSpotDetector() = default;
+
+void BrightSpotDetector::setThreshold(int threshold) {
+    threshold_ = std::max(0, std::min(255, threshold));
+}
+
+void BrightSpotDetector::setRoi(const cv::Rect& roi) {
+    roi_ = roi;
+    useRoi_ = (roi.width > 0 && roi.height > 0);
+}
+
+cv::Point2f BrightSpotDetector::detect(const cv::Mat& frame) {
+    if (frame.empty()) return cv::Point2f(-1, -1);
+
+    cv::Mat gray;
+    if (frame.channels() == 3) {
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = frame;
+    }
+
+    // 提取ROI
+    cv::Mat roiImg;
+    if (useRoi_) {
+        if (roi_.x < 0 || roi_.y < 0 ||
+            roi_.x + roi_.width > gray.cols ||
+            roi_.y + roi_.height > gray.rows) {
+            return cv::Point2f(-1, -1);
+        }
+        roiImg = gray(roi_);
+    } else {
+        roiImg = gray;
+    }
+
+    // 高斯模糊去噪
+    cv::GaussianBlur(roiImg, roiImg, cv::Size(5, 5), 0);
+
+    // 找全局最大值
+    double minVal, maxVal;
+    cv::Point minLoc, maxLoc;
+    cv::minMaxLoc(roiImg, &minVal, &maxVal, &minLoc, &maxLoc);
+
+    if (maxVal < threshold_) {
+        return cv::Point2f(-1, -1);
+    }
+
+    // 以自适应阈值提取高亮区域，计算重心（更鲁棒）
+    int adaptiveThresh = std::max(threshold_, static_cast<int>(maxVal * 0.7));
+    cv::Mat mask;
+    cv::threshold(roiImg, mask, adaptiveThresh, 255, cv::THRESH_BINARY);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    if (contours.empty()) {
+        //  fallback：直接返回最亮点
+        cv::Point2f spot(static_cast<float>(maxLoc.x), static_cast<float>(maxLoc.y));
+        if (useRoi_) { spot.x += roi_.x; spot.y += roi_.y; }
+        return spot;
+    }
+
+    // 取最大轮廓
+    auto maxIt = std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {
+            return cv::contourArea(a) < cv::contourArea(b);
+        });
+
+    cv::Moments m = cv::moments(*maxIt);
+    if (m.m00 < 1.0) {
+        cv::Point2f spot(static_cast<float>(maxLoc.x), static_cast<float>(maxLoc.y));
+        if (useRoi_) { spot.x += roi_.x; spot.y += roi_.y; }
+        return spot;
+    }
+
+    cv::Point2f spot(
+        static_cast<float>(m.m10 / m.m00),
+        static_cast<float>(m.m01 / m.m00)
+    );
+
+    if (useRoi_) {
+        spot.x += roi_.x;
+        spot.y += roi_.y;
+    }
+    return spot;
 }
 
 // ========== 工厂函数 ==========

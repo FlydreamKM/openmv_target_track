@@ -9,6 +9,7 @@
 #include "target_detector.hpp"
 #include "pose_estimator.hpp"
 #include "serial_output.hpp"
+#include "imu_interface.hpp"
 
 using namespace omt;
 
@@ -21,26 +22,31 @@ void signal_handler(int sig) {
 void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " [options]\n"
               << "Options:\n"
-              << "  -m, --mode <aruco|circle>    Detection mode (default: aruco)\n"
-              << "  -d, --device <index|path>    Camera device (default: 0)\n"
-              << "  -c, --calib <path>           Calibration file (YAML)\n"
-              << "  -e, --ext <path>             Extrinsics file for world coords\n"
-              << "  -s, --size <meters>          Target real size (default: 0.165)\n"
-              << "  -o, --output <serial|udp>    Output method\n"
-              << "  --serial <device>            Serial port (e.g., /dev/ttyUSB0)\n"
-              << "  --udp <ip:port>              UDP target (e.g., 192.168.1.100:5005)\n"
+              << "  -m, --mode <aruco|circle|square>  Detection mode (default: aruco)\n"
+              << "  -d, --device <index|path>         Camera device (default: 0)\n"
+              << "  -c, --calib <path>                Calibration file (YAML)\n"
+              << "  -e, --ext <path>                  Extrinsics file for world coords\n"
+              << "  -s, --size <meters>               Target real size (default: 0.165)\n"
+              << "  -o, --output <serial|udp>         Output method\n"
+              << "  --serial <device>                 Serial port (e.g., /dev/ttyUSB0)\n"
+              << "  --udp <ip:port>                   UDP target (e.g., 192.168.1.100:5005)\n"
               << "  -f, --format <json|csv|bin|custom> Output format (default: json)\n"
-              << "  -r, --res <WxH>              Resolution (default: 640x480)\n"
-              << "  --fov <degrees>              Horizontal FOV (default: 90)\n"
-              << "  --show                       Show debug window\n"
-              << "  --headless                   No GUI, text only\n"
-              << "  -h, --help                   This help\n"
+              << "  -r, --res <WxH>                   Resolution (default: 640x480)\n"
+              << "  --fov <degrees>                   Horizontal FOV (default: 90)\n"
+              << "  --show                            Show debug window\n"
+              << "  --headless                        No GUI, text only\n"
+              << "  --spot-thresh <0-255>             Bright spot detection threshold (default: 200)\n"
+              << "  --imu-device <path>               IMU serial device (placeholder, user should implement driver)\n"
+              << "  -h, --help                        This help\n"
               << "\nExamples:\n"
               << "  # ArUco marker tracking, 90deg FOV, output JSON to stdout\n"
               << "  " << prog << " -m aruco --fov 90\n"
               << "\n"
               << "  # Circle target (red), output compact format to serial\n"
               << "  " << prog << " -m circle -s 0.10 --serial /dev/ttyS0 -f custom\n"
+              << "\n"
+              << "  # Square target + bright spot error, with IMU pose\n"
+              << "  " << prog << " -m square -s 0.10 --show --spot-thresh 180\n"
               << "\n"
               << "  # With world coordinates (camera extrinsics known)\n"
               << "  " << prog << " -m aruco -e extrinsics.yaml --udp 192.168.1.100:5005\n";
@@ -64,6 +70,8 @@ int main(int argc, char** argv) {
     float hfov = 90.0f;
     bool showWindow = false;
     bool headless = false;
+    int spotThreshold = 200;
+    std::string imuDevice;
 
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
@@ -101,6 +109,10 @@ int main(int argc, char** argv) {
             showWindow = true;
         } else if (arg == "--headless") {
             headless = true;
+        } else if (arg == "--spot-thresh" && i + 1 < argc) {
+            spotThreshold = std::stoi(argv[++i]);
+        } else if (arg == "--imu-device" && i + 1 < argc) {
+            imuDevice = argv[++i];
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -148,10 +160,36 @@ int main(int argc, char** argv) {
             cv::Scalar(0, 100, 100), cv::Scalar(10, 255, 255)
         );
         std::cout << "[INFO] Mode: Circle (red), diameter=" << targetSize << "m" << std::endl;
+    } else if (mode == "square") {
+        detector = std::make_unique<SquareTargetDetector>(SquareTargetDetector::Mode::COLOR, targetSize);
+        // Default red color range for square mode
+        static_cast<SquareTargetDetector*>(detector.get())->setColorRange(
+            cv::Scalar(0, 100, 100), cv::Scalar(10, 255, 255)
+        );
+        std::cout << "[INFO] Mode: Square (red), size=" << targetSize << "m" << std::endl;
     } else {
         std::cerr << "[ERROR] Unknown mode: " << mode << std::endl;
         return 1;
     }
+
+    // Create bright spot detector (enabled for square mode by default)
+    BrightSpotDetector spotDetector;
+    spotDetector.setThreshold(spotThreshold);
+    bool enableSpotDetection = (mode == "square");
+    if (enableSpotDetection) {
+        std::cout << "[INFO] Bright spot detection enabled, threshold=" << spotThreshold << std::endl;
+    }
+
+    // Create IMU interface
+    // 用户应在此处实例化自己的IMU驱动类，继承自 ImuInterface
+    // 示例：若 imuDevice 非空，可实例化 SerialImu(imuDevice)
+    // 当前使用 DummyImu 作为占位，用户需替换为实际实现
+    std::unique_ptr<ImuInterface> imu;
+    if (!imuDevice.empty()) {
+        std::cout << "[INFO] IMU device specified: " << imuDevice << std::endl;
+        std::cout << "[INFO] Please replace DummyImu with your own ImuInterface implementation." << std::endl;
+    }
+    imu = std::make_unique<DummyImu>();
 
     // Create pose estimator
     PoseEstimator estimator(calib);
@@ -215,8 +253,19 @@ int main(int argc, char** argv) {
 
         if (frame.empty()) continue;
 
+        // Update IMU data every frame
+        if (imu) {
+            imu->update();
+        }
+
         // Detect targets
         auto results = detector->detect(frame);
+
+        // Detect bright spot (if enabled)
+        cv::Point2f spot(-1, -1);
+        if (enableSpotDetection) {
+            spot = spotDetector.detect(frame);
+        }
 
         // Process each target
         for (const auto& target : results) {
@@ -225,9 +274,27 @@ int main(int argc, char** argv) {
             Pose3D pose;
             if (mode == "aruco") {
                 pose = estimator.estimateAruco(target, targetSize);
-            } else {
+            } else if (mode == "circle") {
                 pose = estimator.estimateCircle(target, targetSize);
+            } else if (mode == "square") {
+                pose = estimator.estimateSquare(target, targetSize);
             }
+
+            // If spot detected and target valid, compute spot error
+            if (pose.valid && enableSpotDetection && spot.x >= 0) {
+                float depthZ = pose.cameraCoord.z; // use target depth
+                Pose3D spotPose = estimator.estimateSpotError(target, spot, depthZ);
+                // Merge spot info into main pose
+                pose.hasBrightSpot = spotPose.hasBrightSpot;
+                pose.brightSpotPixel = spotPose.brightSpotPixel;
+                pose.spotOffsetX = spotPose.spotOffsetX;
+                pose.spotOffsetY = spotPose.spotOffsetY;
+                pose.spotYaw = spotPose.spotYaw;
+                pose.spotPitch = spotPose.spotPitch;
+            }
+
+            // Inject IMU data into pose
+            PoseEstimator::injectImuData(pose, imu.get());
 
             if (pose.valid) {
                 writer.write(pose, target.id);
@@ -237,6 +304,16 @@ int main(int argc, char** argv) {
         // Debug visualization
         if (showWindow && !headless) {
             detector->drawResults(frame, results);
+
+            // Draw bright spot
+            if (enableSpotDetection && spot.x >= 0) {
+                cv::circle(frame, cv::Point(static_cast<int>(spot.x), static_cast<int>(spot.y)),
+                           8, cv::Scalar(0, 255, 255), 2);
+                cv::circle(frame, cv::Point(static_cast<int>(spot.x), static_cast<int>(spot.y)),
+                           2, cv::Scalar(0, 0, 255), -1);
+                cv::putText(frame, "Spot", cv::Point(static_cast<int>(spot.x) + 10, static_cast<int>(spot.y) - 10),
+                           cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 2);
+            }
 
             // Draw crosshair at image center
             cv::Point center(calib.imageWidth / 2, calib.imageHeight / 2);

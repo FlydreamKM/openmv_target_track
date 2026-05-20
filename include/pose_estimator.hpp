@@ -3,6 +3,7 @@
 
 #include <opencv2/opencv.hpp>
 #include "target_detector.hpp"
+#include "imu_interface.hpp"
 
 namespace omt {
 
@@ -33,6 +34,19 @@ struct Pose3D {
     cv::Point2f targetCenter;     // 靶标中心
     
     bool valid = false;
+
+    // ========== 光点误差信息 ==========
+    bool hasBrightSpot = false;   // 是否检测到光点
+    cv::Point2f brightSpotPixel;  // 光点像素坐标
+    float spotOffsetX = 0.0f;     // 光点相对靶标中心的像素误差 X（右正）
+    float spotOffsetY = 0.0f;     // 光点相对靶标中心的像素误差 Y（下正）
+    float spotYaw = 0.0f;         // 光点水平偏角（弧度）
+    float spotPitch = 0.0f;       // 光点俯仰偏角（弧度）
+
+    // ========== IMU姿态信息 ==========
+    bool hasImu = false;          // 是否有IMU数据
+    cv::Vec4f imuQuaternion = cv::Vec4f(1.0f, 0.0f, 0.0f, 0.0f); // (w,x,y,z)
+    cv::Point3f imuEulerDeg;      // roll, pitch, yaw（度）
 };
 
 /**
@@ -43,7 +57,7 @@ struct CameraCalibration {
     cv::Mat distCoeffs;       // 畸变系数（1x4或1x5，无畸变可全0）
     int imageWidth = 640;
     int imageHeight = 480;
-    float hfov_deg = 90.0f;   // 水平视场角（度）
+    float hfov_deg = 136.0f;   // 水平视场角（度）
     float vfov_deg = 0.0f;    // 垂直视场角（度，0表示自动计算）
     
     /**
@@ -110,6 +124,14 @@ public:
      * @return 三维位姿
      */
     Pose3D estimateCircle(const TargetResult& target, float realDiameter);
+
+    /**
+     * @brief 估计方形靶标位姿（使用solvePnP）
+     * @param target 检测结果（要求 corners 为4个角点）
+     * @param realSize 方形靶标实际边长（米）
+     * @return 三维位姿
+     */
+    Pose3D estimateSquare(const TargetResult& target, float realSize);
     
     /**
      * @brief 通用的单点估计（已知深度Z时）
@@ -118,6 +140,22 @@ public:
      * @return 三维位姿
      */
     Pose3D estimateAtDepth(const cv::Point2f& pixel, float depthZ);
+
+    /**
+     * @brief 计算光点相对靶标中心的误差角
+     * @param target 靶标检测结果（用于获取中心与深度）
+     * @param spotPixel 光点像素坐标
+     * @param depthZ 靶标深度（米），可由 estimateSquare/ArUco 得到
+     * @return 包含 spotOffsetX/Y、spotYaw/Pitch 的 Pose3D 结构
+     */
+    Pose3D estimateSpotError(const TargetResult& target, const cv::Point2f& spotPixel, float depthZ);
+
+    /**
+     * @brief 将IMU数据注入Pose3D
+     * @param pose 待填充的位姿结构
+     * @param imu IMU接口指针（若为nullptr则不做任何事）
+     */
+    static void injectImuData(Pose3D& pose, const ImuInterface* imu);
     
     /**
      * @brief 获取相机参数
@@ -141,6 +179,12 @@ private:
     
     // ArUco标记3D模型点（单位正方形，中心在原点，Z=0平面）
     static std::vector<cv::Point3f> getArucoObjectPoints(float size);
+
+    // 方形靶标3D模型点（与ArUco一致）
+    static std::vector<cv::Point3f> getSquareObjectPoints(float size);
+
+    // 通用后处理：相机坐标 -> 世界坐标、角度计算等
+    void fillPoseAnglesAndWorld(Pose3D& pose) const;
 };
 
 } // namespace omt

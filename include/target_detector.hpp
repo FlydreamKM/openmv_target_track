@@ -134,6 +134,97 @@ private:
 };
 
 /**
+ * @brief 方形靶标检测器（基于颜色阈值+四边形轮廓）
+ *
+ * 适用于纯色方形/矩形靶标。检测流程：
+ *   1. HSV颜色阈值分割
+ *   2. 形态学去噪 + 轮廓提取
+ *   3. 凸包与多边形近似（approxPolyDP）
+ *   4. 筛选接近四边形、面积足够、宽高比合理的轮廓
+ *   5. 返回角点（顺时针或逆时针4个点）与中心
+ */
+class SquareTargetDetector : public TargetDetector {
+public:
+    /**
+     * @brief 检测模式
+     */
+    enum class Mode {
+        COLOR,   // 基于HSV颜色阈值+轮廓（推荐）
+        EDGE     // 基于边缘检测（对复杂背景鲁棒性更好）
+    };
+
+    /**
+     * @brief 构造函数
+     * @param mode 检测模式
+     * @param realSizeMeters 方形靶标实际边长（米）
+     */
+    explicit SquareTargetDetector(Mode mode = Mode::COLOR,
+                                  float realSizeMeters = 0.10f);
+
+    std::vector<TargetResult> detect(const cv::Mat& frame) override;
+    void setParam(const std::string& key, double value) override;
+
+    // 颜色阈值设置（HSV空间）- 仅COLOR模式
+    void setColorRange(const cv::Scalar& lower, const cv::Scalar& upper);
+
+    float getRealSize() const { return realSizeMeters_; }
+    void setRealSize(float size) { realSizeMeters_ = size; }
+
+private:
+    Mode mode_;
+    float realSizeMeters_;
+
+    // 颜色阈值（COLOR模式）
+    cv::Scalar hsvLower_ = cv::Scalar(0, 100, 100);   // 默认红色下限
+    cv::Scalar hsvUpper_ = cv::Scalar(10, 255, 255); // 默认红色上限
+
+    // 几何筛选参数
+    double minArea_ = 500.0;          // 最小面积（像素）
+    double maxAspectRatio_ = 2.0;     // 最大允许宽高比
+    double minCircularity_ = 0.7;     // 最小矩形度（轮廓面积 / 最小外接矩形面积）
+
+    std::vector<TargetResult> detectColor_(const cv::Mat& frame);
+    std::vector<TargetResult> detectEdge_(const cv::Mat& frame);
+
+    // 判断4个点是否构成近似矩形，并返回平均边长
+    static bool isApproximatelySquare(const std::vector<cv::Point2f>& pts, float& outSideLength);
+};
+
+/**
+ * @brief 最亮光点检测器
+ *
+ * 用于检测激光点、LED光斑等高亮目标。检测流程：
+ *   1. 灰度化 + 高斯模糊去噪
+ *   2. 全局最亮点定位
+ *   3. 以阈值提取高亮区域并计算重心
+ */
+class BrightSpotDetector {
+public:
+    BrightSpotDetector();
+
+    /**
+     * @brief 检测最亮光点
+     * @param frame 输入图像（BGR或灰度）
+     * @return 光点像素坐标；若未检测到有效光点，返回 (-1, -1)
+     */
+    cv::Point2f detect(const cv::Mat& frame);
+
+    /** @brief 设置最小亮度阈值（0-255），默认200 */
+    void setThreshold(int threshold);
+
+    /** @brief 设置ROI区域（全图检测则设为空Rect） */
+    void setRoi(const cv::Rect& roi);
+
+    /** @brief 获取当前阈值 */
+    int getThreshold() const { return threshold_; }
+
+private:
+    int threshold_ = 200;
+    cv::Rect roi_;
+    bool useRoi_ = false;
+};
+
+/**
  * @brief 创建默认检测器（优先ArUco）
  */
 std::unique_ptr<TargetDetector> createDefaultDetector();
